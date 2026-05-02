@@ -270,6 +270,29 @@ class AVRParams:
     enabled: bool = False   # toggle AVR simulation on/off
 
 
+
+@dataclass
+class IEEE141Result:
+    # IEEE 141 / Red Book simplified motor starting voltage dip result.
+    # Replicates VDIP / legacy vendor tool methodology.
+    # Formula: Vdip = SkVA / (SkVA + Gen_kVA / Xd_prime) * 100
+    # Xd_prime = X'd TRANSIENT UNSATURATED (e.g. KATO 0.253, Hyundai 0.293)
+    # NOT the subtransient Xd" used for relay coordination.
+    gen_kva:        float = 0.0
+    Xd_prime:       float = 0.0
+    motor_skva:     float = 0.0
+    motor_pf:       float = 0.15
+    preload_kva:    float = 0.0
+    preload_pf:     float = 0.85
+    vdip_base_pct:  float = 0.0   # % dip no preload (matches vendor 'Vdip w/o Preload')
+    vt_base:        float = 0.0   # pu
+    vdip_final_pct: float = 0.0   # % dip with preload E0 correction
+    vt_final:       float = 0.0   # pu
+    preload_mult:   float = 1.0   # preload correction factor
+    sc_kva:         float = 0.0   # Gen_kVA / X'd (short-circuit kVA)
+    motor_pct_gen:  float = 0.0   # motor SkVA as % of generator
+
+
 @dataclass
 class StudyResult:
     """Full result set for one study."""
@@ -546,6 +569,77 @@ def simulate_avr_response(gen: GeneratorParams,
     return times, volts
 
 
+def calc_ieee141(gen: GeneratorParams,
+                 motor_skva: float,
+                 motor_pf: float,
+                 preload_kva: float = 0.0,
+                 preload_pf:  float = 0.85,
+                 xdp_override: float = None,
+                 preload_mult_override: float = None) -> IEEE141Result:
+    # IEEE 141 / Red Book simplified motor starting voltage dip.
+    # Replicates the legacy VDIP tool methodology used for generator performance
+    # and motor starting acceptance studies.
+    #
+    # Base formula (no preload):
+    #   Vdip = SkVA / (SkVA + Gen_kVA / X'd)
+    # Preload correction (E0-based):
+    #   AVR holds Vt=1.0 against preload reactive current -> E0 > 1.0
+    #   E0 = 1 + X'd * I_preload_pu * sin(phi_preload)
+    #   Vt_post = E0 / (1 + X'd * SkVA_motor / Gen_kVA)
+    #
+    # xdp_override: use the UNSATURATED transient X'd from the datasheet.
+    #   KATO 4P11-3600:  X'd unsat = 0.253
+    #   Hyundai EE-8965: X'd unsat = 0.293
+    #   If None, uses gen.Xdp (which may be the saturated value).
+    # preload_mult_override: enter the 'Preload mult' value from your vendor
+    #   VDIP output directly (e.g. 1.03). This exactly replicates the vendor
+    #   result. If None, an E0-based physical correction is used.
+    Xdp = xdp_override if xdp_override is not None else gen.Xdp
+    if not Xdp or not gen.kva:
+        return IEEE141Result()
+
+    sc_kva   = gen.kva / Xdp
+    S_mot_pu = motor_skva / gen.kva
+
+    # Base dip — no preload
+    vt_base   = 1.0 / (1.0 + Xdp * S_mot_pu)
+    vdip_base = (1.0 - vt_base) * 100.0
+
+    # Preload correction
+    # preload_mult_override: enter the multiplier directly from your VDIP/vendor
+    # output (e.g. 1.03). This exactly replicates vendor results.
+    # If None, the E0-based physical correction is used instead.
+    if preload_kva > 0 and preload_mult_override is not None:
+        # Direct multiplier — matches vendor VDIP output exactly
+        mult       = preload_mult_override
+        vdip_final = vdip_base * mult
+        vt_final   = 1.0 - vdip_final / 100.0
+    elif preload_kva > 0:
+        # E0-based physical correction (AVR holds Vt=1.0 against preload reactive)
+        I_pre_pu    = preload_kva / gen.kva
+        sin_phi_pre = math.sqrt(max(0.0, 1.0 - preload_pf ** 2))
+        E0          = 1.0 + Xdp * I_pre_pu * sin_phi_pre
+        vt_final    = E0 / (1.0 + Xdp * S_mot_pu)
+        vdip_final  = (1.0 - vt_final) * 100.0
+        mult        = vdip_final / vdip_base if vdip_base > 0 else 1.0
+    else:
+        vt_final, vdip_final, mult = vt_base, vdip_base, 1.0
+
+    return IEEE141Result(
+        gen_kva=gen.kva, Xd_prime=Xdp,
+        motor_skva=motor_skva, motor_pf=motor_pf,
+        preload_kva=preload_kva, preload_pf=preload_pf,
+        vdip_base_pct=round(vdip_base, 4),
+        vt_base=round(vt_base, 6),
+        vdip_final_pct=round(vdip_final, 4),
+        vt_final=round(vt_final, 6),
+        preload_mult=round(mult, 4),
+        sc_kva=round(sc_kva, 1),
+        motor_pct_gen=round(motor_skva / gen.kva * 100.0, 2),
+    )
+
+
+
 def run_step_study(gen: GeneratorParams, load: StepLoadParams) -> StudyResult:
     """Step load study — generator at no-load before disturbance."""
     load_pu = load.load_kva / gen.kva
@@ -741,6 +835,95 @@ def print_study(result: StudyResult) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Excel Report Export
 # ─────────────────────────────────────────────────────────────────────────────
+def _export_ieee141(r: IEEE141Result, path: str) -> None:
+    import os
+    try:
+        from openpyxl import load_workbook, Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+    except ImportError:
+        print('openpyxl not installed -- skipping Excel export'); return
+
+    wb = load_workbook(path) if os.path.exists(path) else Workbook()
+    if 'Sheet' in wb.sheetnames: del wb['Sheet']
+
+    sname = 'IEEE 141 Motor Starting'
+    if sname in wb.sheetnames: del wb[sname]
+    ws = wb.create_sheet(sname, 0)
+    ws.column_dimensions['A'].width = 40
+    ws.column_dimensions['B'].width = 20
+    ws.column_dimensions['C'].width = 16
+
+    def h(row, text, bg='1F4E79'):
+        ws.merge_cells(f'A{row}:C{row}')
+        c = ws.cell(row=row, column=1, value=text)
+        c.font = Font(name='Arial', bold=True, size=11, color='FFFFFF')
+        c.fill = PatternFill('solid', start_color=bg)
+        c.alignment = Alignment(horizontal='left', vertical='center', indent=1)
+        ws.row_dimensions[row].height = 22
+
+    def d(row, label, val, unit='', bg='F5F7FA'):
+        fill = PatternFill('solid', start_color=bg)
+        lc = ws.cell(row=row, column=1, value=label)
+        lc.font = Font(name='Arial', size=10)
+        lc.fill = fill
+        lc.alignment = Alignment(vertical='center', indent=1)
+        vc = ws.cell(row=row, column=2, value=val)
+        vc.font = Font(name='Arial', size=10, bold=True)
+        vc.fill = fill
+        vc.alignment = Alignment(horizontal='center', vertical='center')
+        uc = ws.cell(row=row, column=3, value=unit)
+        uc.font = Font(name='Arial', size=9, italic=True, color='888888')
+        uc.fill = fill
+        ws.row_dimensions[row].height = 18
+
+    h(1, 'IEEE 141 Motor Starting Voltage Dip -- Simplified Transient Method')
+    h(2, 'Vdip = SkVA / (SkVA + Gen_kVA / Xd_prime)  --  constant impedance, Ra=0', '2E75B6')
+    ws.row_dimensions[2].height = 18
+
+    d(4,  'Generator kVA',                               r.gen_kva,       'kVA')
+    d(5,  "X'd  transient UNSATURATED (use from datasheet)", r.Xd_prime,  'pu')
+    d(6,  'Short-circuit kVA  (Gen_kVA / Xd_prime)',     r.sc_kva,        'kVA')
+    d(7,  'Motor starting kVA',                          r.motor_skva,    'kVA')
+    d(8,  'Motor as % of generator',                     r.motor_pct_gen, '%')
+    d(9,  'Motor inrush PF',                             r.motor_pf,      'lagging')
+    if r.preload_kva > 0:
+        d(10, 'Pre-existing load',  r.preload_kva, 'kVA')
+        d(11, 'Pre-existing PF',    r.preload_pf,  '')
+
+    h(13, 'Results', '2E75B6')
+    d(14, 'Vdip base -- no preload  (= vendor "Vdip w/o Preload")',
+          f'{r.vdip_base_pct:.2f}%', '', 'FFF3CD')
+    d(15, 'Vt base', f'{r.vt_base:.4f} pu', '', 'FFF3CD')
+    if r.preload_kva > 0:
+        d(16, 'Preload E0 correction mult',  f'x{r.preload_mult:.4f}', '', 'D4EDDA')
+        d(17, 'Vdip final  (with preload)',  f'{r.vdip_final_pct:.2f}%', '', 'D4EDDA')
+        d(18, 'Vt final',  f'{r.vt_final:.4f} pu', '', 'D4EDDA')
+
+    notes = [
+        "Uses X'd transient UNSATURATED -- NOT Xd\" subtransient."
+        " KATO: 0.253  Hyundai EE-8965: 0.293",
+        'Matches IEEE 141 / Red Book methodology for motor starting studies.',
+        'Use for: generator sizing, motor starting acceptance, gen performance.',
+        'Do NOT use for relay coordination -- use NR salient-pole Xd" instead.',
+        'Vendor VDIP preload multiplier is proprietary; '
+        'this tool uses E0-based correction. Small differences are normal.',
+    ]
+    h(20, 'Notes', '888888')
+    for i, note in enumerate(notes):
+        rn = 21 + i
+        ws.merge_cells(f'A{rn}:C{rn}')
+        c = ws.cell(row=rn, column=1, value='  >> ' + note)
+        c.font = Font(name='Arial', size=9, italic=True)
+        c.fill = PatternFill('solid', start_color='EBF3FB')
+        c.alignment = Alignment(horizontal='left', vertical='center',
+                                indent=1, wrap_text=True)
+        ws.row_dimensions[rn].height = 20
+
+    wb.save(path)
+    print(f'  IEEE 141 sheet written to: {path}')
+
+
+
 def export_excel(results: list[StudyResult], path: str) -> None:
     """
     Export all study results to a formatted Excel workbook.
@@ -1228,6 +1411,36 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def print_ieee141(r: IEEE141Result) -> None:
+    LINE78 = chr(8212)*0 + '-'*78
+    print()
+    print('=' * 78)
+    print('  IEEE 141 MOTOR STARTING VOLTAGE DIP  --  Simplified Transient Method')
+    print('=' * 78)
+    print(f'  Generator  : {r.gen_kva:.0f} kVA')
+    print(f"  X'd used   : {r.Xd_prime:.4f} pu  (transient UNSATURATED -- NOT Xd\" subtransient)")
+    print(f"  SC kVA     : {r.sc_kva:.0f} kVA  (= {r.gen_kva:.0f} / {r.Xd_prime:.4f})")
+    print(LINE78)
+    print(f'  Motor starting kVA : {r.motor_skva:.1f} kVA  ({r.motor_pct_gen:.1f}% of generator)')
+    print(f'  Motor inrush PF    : {r.motor_pf:.3f}')
+    if r.preload_kva > 0:
+        print(f'  Pre-existing load  : {r.preload_kva:.0f} kVA  at PF {r.preload_pf:.3f}')
+    print(LINE78)
+    print(f"  Formula: Vdip = SkVA / (SkVA + Gen_kVA/X'd)")
+    print(f'         = {r.motor_skva:.1f} / ({r.motor_skva:.1f} + {r.sc_kva:.0f})')
+    denom = r.motor_skva + r.sc_kva
+    print(f'         = {r.motor_skva:.1f} / {denom:.1f}')
+    print(LINE78)
+    print(f'  Vdip base (no preload)  : {r.vdip_base_pct:.2f}%   Vt = {r.vt_base:.4f} pu')
+    if r.preload_kva > 0:
+        print(f'  Preload correction mult : x{r.preload_mult:.4f}')
+        print(f'  Vdip final (w/preload)  : {r.vdip_final_pct:.2f}%   Vt = {r.vt_final:.4f} pu')
+    print(LINE78)
+    print('  Use for: generator sizing, motor starting acceptance, generator performance')
+    print('  NOT for: relay / protection coordination  (use NR Xd" for that)')
+
+
+
 def main() -> None:
     parser = build_parser()
     args   = parser.parse_args()
@@ -1293,6 +1506,8 @@ def main() -> None:
         use_sat=args.saturation,
     )
 
+    method = args.method
+
     avr = AVRParams(
         KA=args.ka, TA=args.ta, KE=args.ke, TE=args.te,
         VRMAX=args.vrmax, VRMIN=args.vrmin,
@@ -1330,7 +1545,26 @@ def main() -> None:
         )
         results.append(run_motor_study_avr(g, motor, avr))
 
-    if not results:
+    # ── IEEE 141 method ────────────────────────────────────────────────────
+    if method in ('ieee141', 'both'):
+        _skva = (motor_kva or
+                 (args.load_kw / args.load_pf
+                  if args.load_kw and args.load_pf else 0))
+        _pf = (args.motor_pf if motor_kva
+               else (args.load_pf if args.load_kw else 0.8))
+        if _skva and g.kva:
+            _ieee = calc_ieee141(
+                g, _skva, _pf,
+                args.base_kva, args.base_pf,
+                xdp_override=args.xdp_unsat,
+                preload_mult_override=args.preload_mult,
+            )
+            print_ieee141(_ieee)
+            if args.export:
+                _export_ieee141(_ieee, args.export)
+
+
+    if not results and method == 'nr':
         print("\nNo studies run — check inputs. Use --help for usage.")
         sys.exit(1)
 
