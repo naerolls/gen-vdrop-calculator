@@ -1399,6 +1399,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--start-mult',  type=float, default=6.0,
                    help='Starting kVA multiplier for HP method (default 6.0)')
 
+    # Calculation method
+    p.add_argument('--method', choices=['nr', 'ieee141', 'both'], default='nr',
+                   help=('nr=NR salient-pole Xd" (relay/UPS coordination), '
+                         'ieee141=simplified X-transient (motor starting/gen performance), '
+                         'both=run both and compare. Default: nr'))
+    p.add_argument('--xdp-unsat', type=float, default=None, dest='xdp_unsat',
+                   help=('X-prime-d UNSATURATED transient reactance for ieee141 method (pu). '
+                         'Use unsaturated column from datasheet: KATO=0.253, Hyundai=0.293. '
+                         'If omitted, uses --xdp value.'))
+    p.add_argument('--preload-mult', type=float, default=None, dest='preload_mult',
+                   help=('Preload multiplier from vendor VDIP output (e.g. 1.03). '
+                         'Overrides E0-based correction and exactly replicates vendor result. '
+                         'If omitted, E0 correction is used.'))
+
     # Output
     p.add_argument('--export', metavar='FILE.xlsx',
                    help='Export results to Excel workbook')
