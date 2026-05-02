@@ -239,6 +239,37 @@ class PeriodResult:
         return None   # filled in externally with gen.voltage
 
 
+
+@dataclass
+class AVRParams:
+    """
+    IEEE Type I (simplified DC1A) exciter / AVR parameters.
+
+    From the CGCM configuration (Allen-Bradley or equivalent digital AVR):
+        KA    — voltage regulator gain           (typ 200–400)
+        TA    — regulator time constant (s)      (typ 0.01–0.05 s)
+        VRMAX — ceiling (max field) voltage (pu) (typ 4–7 pu)
+        VRMIN — minimum field voltage (pu)       (typ −1 to 0 pu)
+
+    From the generator datasheet:
+        KE    — exciter self-excitation constant (on datasheet)
+        TE    — exciter time constant (s)        (on datasheet)
+
+    State equations (Euler integration):
+        dVR/dt = (KA × (Vref − Vt) − VR) / TA
+        dEq/dt = (VR − KE × Eq) / TE
+
+    Vref is calculated from pre-event steady-state so initial dVR/dt = 0.
+    """
+    KA:    float = 200.0    # voltage regulator gain
+    TA:    float = 0.02     # regulator time constant (s)
+    KE:    float = 1.0      # exciter self-excitation constant
+    TE:    float = 0.177    # exciter time constant (s)
+    VRMAX: float = 5.0      # ceiling voltage (pu)
+    VRMIN: float = -1.0     # minimum field voltage (pu)
+    enabled: bool = False   # toggle AVR simulation on/off
+
+
 @dataclass
 class StudyResult:
     """Full result set for one study."""
@@ -257,6 +288,8 @@ class StudyResult:
     S_total_kva: float = 0.0
     eff_pf:     float = 0.0
     S_total_pct: float = 0.0
+    avr_times:   list = field(default_factory=list)   # time vector (s)
+    avr_volts:   list = field(default_factory=list)   # Vt(t) from AVR sim
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -444,6 +477,75 @@ def simplified_dip(X: float, I_pu: float, pf: float) -> Optional[float]:
 # ─────────────────────────────────────────────────────────────────────────────
 # Study Runners
 # ─────────────────────────────────────────────────────────────────────────────
+
+def simulate_avr_response(gen: GeneratorParams,
+                           avr: AVRParams,
+                           S_pu: float,
+                           phi: float,
+                           I_base_pu: float = 0.0,
+                           phi_base: float = 0.0,
+                           dt: float = 0.002,
+                           T_total: float = 2.5) -> tuple[list, list]:
+    """
+    Simulate terminal voltage recovery with IEEE Type I AVR model.
+
+    Two-phase approach:
+      Phase 1  (0 – T_sub = 50 ms)  : Subtransient window — Xd"/Xq" fixed,
+                                       AVR has not yet responded.
+      Phase 2  (T_sub – T_total)    : Transient+recovery — Xd'/Xq' used,
+                                       AVR actively regulates terminal voltage.
+
+    The transition at 50 ms reflects the natural decay of subtransient flux
+    components, consistent with the two-period NR model.
+
+    Returns
+    -------
+    times : list[float]  Time vector (s)
+    volts : list[float]  Terminal voltage Vt (pu) at each time step
+    """
+    T_sub = 0.05
+
+    # Pre-event E_q using Xd' (AVR operates on transient timescale)
+    eq_pre_pp = SalientPoleNR.calc_Eq_pre(1.0, I_base_pu, phi_base,
+                                           gen.Xdpp, gen.Xqpp, gen.R1)
+    eq_pre_p  = SalientPoleNR.calc_Eq_pre(1.0, I_base_pu, phi_base,
+                                           gen.Xdp,  gen.Xqp,  gen.R1)
+    Eq_pp = eq_pre_pp[0]
+    Eq_p  = eq_pre_p[0]
+
+    # Initial AVR state — set so dVR/dt = 0 at t = 0
+    VR0  = avr.KE * Eq_p
+    Vref = 1.0 + VR0 / avr.KA
+
+    times: list = []
+    volts: list = []
+
+    # Phase 1: subtransient window — open-loop, Eq fixed at Xd" level
+    t = 0.0
+    while t < T_sub - dt / 2:
+        Vt = SalientPoleNR.solve(Eq_pp, S_pu, phi,
+                                  gen.Xdpp, gen.Xqpp, gen.R1)[0] or 0.0
+        times.append(round(t, 4))
+        volts.append(Vt)
+        t += dt
+
+    # Phase 2: transient+recovery with AVR integrating
+    Eq = Eq_p
+    VR = VR0
+    while t <= T_total + dt / 2:
+        Vt = SalientPoleNR.solve(Eq, S_pu, phi,
+                                  gen.Xdp, gen.Xqp, gen.R1)[0] or 0.0
+        times.append(round(t, 4))
+        volts.append(Vt)
+        dVR = (avr.KA * (Vref - Vt) - VR) / avr.TA
+        dEq  = (VR - avr.KE * Eq) / avr.TE
+        VR   = max(avr.VRMIN, min(avr.VRMAX, VR + dVR * dt))
+        Eq  += dEq * dt
+        t   += dt
+
+    return times, volts
+
+
 def run_step_study(gen: GeneratorParams, load: StepLoadParams) -> StudyResult:
     """Step load study — generator at no-load before disturbance."""
     load_pu = load.load_kva / gen.kva
@@ -541,6 +643,33 @@ def run_motor_study(gen: GeneratorParams, motor: MotorStartParams) -> StudyResul
             Vt=Vt, delta=delta, iters=iters, converged=ok
         ))
 
+    return result
+
+
+def run_motor_study_avr(gen: GeneratorParams,
+                        motor: MotorStartParams,
+                        avr: AVRParams) -> StudyResult:
+    """Run motor starting study and attach AVR simulation times/volts."""
+    result = run_motor_study(gen, motor)
+    if avr.enabled and gen.Xdpp and gen.Xqpp:
+        S_pu, phi = motor.combined_load(gen.kva)
+        I_base_pu = motor.base_kva / gen.kva if motor.base_kva > 0 else 0.0
+        phi_base  = motor.base_phi
+        result.avr_times, result.avr_volts = simulate_avr_response(
+            gen, avr, S_pu, phi, I_base_pu, phi_base
+        )
+    return result
+
+
+def run_step_study_avr(gen: GeneratorParams,
+                       load: StepLoadParams,
+                       avr: AVRParams) -> StudyResult:
+    """Run step load study and attach AVR simulation times/volts."""
+    result = run_step_study(gen, load)
+    if avr.enabled and gen.Xdpp and gen.Xqpp:
+        result.avr_times, result.avr_volts = simulate_avr_response(
+            gen, avr, result.load_pu, load.phi
+        )
     return result
 
 
@@ -874,6 +1003,33 @@ def export_excel(results: list[StudyResult], path: str) -> None:
             ws.row_dimensions[r_note].height = 28
             r_note += 1
 
+    # AVR voltage recovery sheet
+    avr_results = [r for r in results if r.avr_times]
+    if avr_results:
+        ws_avr = wb.create_sheet('AVR Response')
+        ws_avr.column_dimensions['A'].width = 14
+        ws_avr.column_dimensions['B'].width = 14
+        ws_avr.column_dimensions['C'].width = 14
+        for col, hdr in enumerate(['Time (s)', 'V_terminal (pu)', 'Dip (%)'], 1):
+            c = ws_avr.cell(row=1, column=col, value=hdr)
+            c.font = Font(name='Arial', bold=True, size=10, color='FFFFFF')
+            c.fill = PatternFill('solid', start_color='1F4E79')
+            c.alignment = Alignment(horizontal='center', vertical='center')
+        for r_idx, result in enumerate(avr_results):
+            col_offset = r_idx * 3
+            if r_idx > 0:
+                for col, hdr in enumerate(['Time (s)', 'V_terminal (pu)', 'Dip (%)'],
+                                           col_offset + 1):
+                    c = ws_avr.cell(row=1, column=col, value=hdr)
+                    c.font = Font(name='Arial', bold=True, size=10, color='FFFFFF')
+                    c.fill = PatternFill('solid', start_color='1F4E79')
+                    c.alignment = Alignment(horizontal='center', vertical='center')
+            for i, (t, v) in enumerate(zip(result.avr_times, result.avr_volts)):
+                row = i + 2
+                ws_avr.cell(row=row, column=col_offset+1, value=round(t, 4))
+                ws_avr.cell(row=row, column=col_offset+2, value=round(v, 5))
+                ws_avr.cell(row=row, column=col_offset+3, value=round((1-v)*100, 3))
+
     wb.save(path)
     print(f"\n  ✔  Report exported to: {path}")
 
@@ -935,7 +1091,7 @@ def interactive_mode() -> tuple[GeneratorParams, list[StudyResult]]:
         load = StepLoadParams()
         load.load_kw = prompt("Applied load (kW)")
         load.load_pf = prompt("Load power factor", 0.80)
-        results.append(run_step_study(g, load))
+        results.append(run_step_study_avr(g, load, avr))
 
     if choice in (2, 3):
         print()
@@ -973,7 +1129,7 @@ def interactive_mode() -> tuple[GeneratorParams, list[StudyResult]]:
             motor.motor_kva = prompt("Motor starting kVA")
 
         motor.motor_pf = prompt("Motor locked-rotor power factor", 0.15)
-        results.append(run_motor_study(g, motor))
+        results.append(run_motor_study_avr(g, motor, avr))
 
     return g, results
 
@@ -1010,6 +1166,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--r1',   type=float, default=0.0,
                    help='R1 positive-sequence / stator resistance (pu)')
     p.add_argument('--x2',   type=float, default=0.0, help='X2 negative sequence (pu)')
+
+    # AVR / CGCM parameters
+    p.add_argument('--avr', action='store_true',
+                   help='Enable IEEE Type I AVR simulation (Allen-Bradley CGCM model)')
+    p.add_argument('--ka',    type=float, default=200.0,
+                   help='AVR voltage regulator gain KA (typ 200–400, default 200)')
+    p.add_argument('--ta',    type=float, default=0.02,
+                   help='AVR regulator time constant TA (s, typ 0.01–0.05, default 0.02)')
+    p.add_argument('--ke',    type=float, default=1.0,
+                   help='Exciter self-excitation constant KE (from datasheet, default 1.0)')
+    p.add_argument('--te',    type=float, default=0.177,
+                   help='Exciter time constant TE (s, from datasheet, default 0.177)')
+    p.add_argument('--vrmax', type=float, default=5.0,
+                   help='Ceiling (max field) voltage VRMAX in pu (typ 4–7, default 5.0)')
+    p.add_argument('--vrmin', type=float, default=-1.0,
+                   help='Minimum field voltage VRMIN in pu (default −1.0)')
     # Saturation coefficients (optional)
     p.add_argument('--se-max',    type=float, default=0.0,
                    help='Saturation factor SE_max at 1.0 pu voltage (from datasheet OCC)')
@@ -1121,6 +1293,12 @@ def main() -> None:
         use_sat=args.saturation,
     )
 
+    avr = AVRParams(
+        KA=args.ka, TA=args.ta, KE=args.ke, TE=args.te,
+        VRMAX=args.vrmax, VRMIN=args.vrmin,
+        enabled=args.avr,
+    )
+
     results = []
 
     # Resolve motor starting kVA from FLA or HP if direct kVA not given
@@ -1141,7 +1319,7 @@ def main() -> None:
 
     if args.mode in ('step', 'both') and args.load_kw:
         load = StepLoadParams(load_kw=args.load_kw, load_pf=args.load_pf)
-        results.append(run_step_study(g, load))
+        results.append(run_step_study_avr(g, load, avr))
 
     if args.mode in ('motor', 'both') and motor_kva:
         motor = MotorStartParams(
@@ -1150,7 +1328,7 @@ def main() -> None:
             motor_kva=motor_kva,
             motor_pf=args.motor_pf,
         )
-        results.append(run_motor_study(g, motor))
+        results.append(run_motor_study_avr(g, motor, avr))
 
     if not results:
         print("\nNo studies run — check inputs. Use --help for usage.")
